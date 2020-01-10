@@ -1,52 +1,156 @@
-import { Backend } from "./backend";
+import Observable from 'zen-observable';
+import { Backend } from './backend';
+import { API } from './types';
 
-function makeCaller(apiName: string) {
-  // We put this on an object to give the function a name.
-  const temp = {
-    async [apiName](...args: any[]) {
-      const res = await fetch("http://localhost:8080", {
-        method: 'POST',
-        mode: 'cors',
-        headers: {
-          "Content-Type": "application/json"
-        },
-        body: JSON.stringify({
-          name: apiName,
-          args
-        })
-      });
-
-      const data = await res.json();
-
-      return data.res;
-    }
-  }
-
-  return temp[apiName];
+interface MagicAPIFrontendConfig {
+    host: string;
+    port: number;
 }
 
-interface MagicAPIConfig {
-  url?: string;
-}
+const DEFAULT_OPTIONS = {
+    host: 'localhost',
+    port: 8080
+};
+
+type AsyncWrap<T extends (...args: any) => any> = ReturnType<T> extends Promise<
+    any
+>
+    ? T
+    : ReturnType<T> extends Observable<any>
+    ? T
+    : (...args: Parameters<T>) => Promise<ReturnType<T>>;
+
+type Frontend<Methods extends API> = {
+    [P in keyof Methods]: AsyncWrap<Methods[P]>;
+};
+
+let currentRequestID = 0;
+const getID = () => `request-${++currentRequestID}`;
+
+type Request = {
+    next: (value: any) => void;
+    error: (value: any) => void;
+    complete?: () => void;
+};
 
 export default function frontend<T extends Backend<any>>(
-  _config?: MagicAPIConfig
-): T extends Backend<infer U> ? U : never {
-  const FUNCTION_CACHE = new Map<string, any>();
+    userConfig: Partial<MagicAPIFrontendConfig> = {}
+): T extends Backend<infer U> ? Frontend<U> : never {
+    const functionCache = new Map<string, any>();
+    const config = { ...DEFAULT_OPTIONS, ...userConfig };
+    const requests = new Map<string, Request>();
 
-  const proxy = new Proxy(
-    {},
-    {
-      get(_target, property: string) {
-        if (!FUNCTION_CACHE.has(property)) {
-          FUNCTION_CACHE.set(property, makeCaller(property));
+    let websocket: WebSocket;
+    const wsPromise = new Promise<WebSocket>(resolve => {
+        const ws = new WebSocket(`ws://${config.host}:${config.port}`, [
+            'magic-api'
+        ]);
+
+        ws.addEventListener('open', () => {
+            websocket = ws;
+            resolve(ws);
+        });
+
+        ws.addEventListener('message', evt => {
+            const { id, next, error, complete } = JSON.parse(evt.data);
+            const request = requests.get(id);
+            if (!request) {
+                return;
+            }
+
+            if (next) {
+                request.next(next);
+                // If promise, next is the final state::
+                if (!request.complete) {
+                    requests.delete(id);
+                }
+            }
+
+            if (error) {
+                request.error(new Error(error));
+                // Errors are a complete state:
+                if (request.complete) {
+                    request.complete();
+                }
+                requests.delete(id);
+            }
+
+            if (complete) {
+                if (request.complete) {
+                    request.complete();
+                }
+                requests.delete(id);
+            }
+        });
+    });
+
+    // Serialize and send JSON to the websocket, in the most optimal way possible.
+    function send(obj: any) {
+        const payload = JSON.stringify(obj);
+
+        if (websocket) {
+            websocket.send(payload);
+        } else {
+            wsPromise.then(ws => ws.send(payload));
         }
-
-        return FUNCTION_CACHE.get(property);
-      }
     }
-  );
 
-  // @ts-ignore The type signature is what matters, the implementation is via proxy.
-  return proxy;
+    function makeCaller(apiName: string) {
+        return function apiImpl(...args: any[]) {
+            return {
+                then(
+                    onFulfilled?: (value: any) => any,
+                    onRejected?: (reason: any) => any
+                ) {
+                    return new Promise((resolve, reject) => {
+                        const id = getID();
+
+                        requests.set(id, {
+                            next: resolve,
+                            error: reject
+                        });
+
+                        send({
+                            id,
+                            name: apiName,
+                            args
+                        });
+                    }).then(onFulfilled, onRejected);
+                },
+                subscribe(observer: ZenObservable.Observer<any>) {
+                    return new Observable((observer) => {
+                        const id = getID();
+
+                        requests.set(id, {
+                            next: observer.next.bind(observer),
+                            error: observer.error.bind(observer),
+                            complete: observer.complete.bind(observer)
+                        });
+
+                        send({
+                            id,
+                            name: apiName,
+                            args
+                        });
+                    }).subscribe(observer);
+                }
+            };
+        };
+    }
+
+    const proxy = new Proxy(
+        {},
+        {
+            get(_target, apiName: string) {
+                if (!functionCache.has(apiName)) {
+                    functionCache.set(apiName, makeCaller(apiName));
+                }
+
+                return functionCache.get(apiName);
+            }
+        }
+    );
+
+    // @ts-ignore The type signature is what matters, the implementation is via proxy.
+    return proxy;
 }
